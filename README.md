@@ -1,6 +1,6 @@
 # REX 4.0: 확산 모델 편집을 위한 적응형 스텝 가이드 (Step-wise Adaptive Guidance)
 
-REX 4.0은 **적응형 스텝 가이드(Step-wise Adaptive Guidance)** 기술을 사용하여 구조적 보존과 의미적 편집의 균형을 맞추는 제로샷(Zero-shot) 이미지 편집 알고리즘입니다.
+REX 4.0은 **적응형 스텝 가이드(Step-wise Adaptive Guidance)** 기술을 사용하여 구조적 보존과 의미적 편집의 균형을 맞추는 제로샷(Zero-shot) 이미지 편집 알고리즘.
 
 ## 🚀 주요 특징
 
@@ -21,13 +21,16 @@ pip install -r requirements.txt
 
 ```bash
 python proposed_algo.py \
-  --prompt_s "a majestic robotic tiger, highly detailed, 4k" \
-  --prompt_k "a simple cat" \
+python proposed_algo.py \
+  --prompt_s "a majestic robotic tiger made of polished chrome and carbon fiber, glowing cyan eyes, mechanical joints, highly detailed, 4k, cyberpunk style" \
+  --prompt_k "a natural orange cat" \
   --image "sample_cat.jpg" \
-  --output "output.png" \
+  --output "rex4_robotic_output.png" \
   --lambda_extrap 5.0 \
   --tau_morph 0.7 \
-  --tau_comp 0.8
+  --tau_comp 0.8 \
+  --w_max 2.0 \
+  --w_step 0.2
 ```
 
 ## 📄 알고리즘 핵심
@@ -35,5 +38,4 @@ python proposed_algo.py \
 매 스텝에서 최소화되는 REX 4.0 목적함수(Objective Function):
 $$Obj = \frac{(w - 1)^2}{2\lambda} + \kappa_t (\tau_{morph} \cdot d_{morph} + \tau_{comp} \cdot d_{comp} - \text{gain} \cdot w)$$
 
-## 🔗 관련 연구
-본 프로젝트는 CVPR, ICCV, NeurIPS 등 AI/컴퓨터 비전 탑 컨퍼런스 투고를 목표로 연구 중입니다.
+
