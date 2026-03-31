@@ -15,21 +15,19 @@ from diffusers import StableDiffusionPipeline
 from diffusers.schedulers import DDIMScheduler
 
 # ============================================================================
-# 이 파일은 REX 4.0 기반 diffusion 편집 알고리즘 구현체임.
-# 핵심 아이디어는 다음과 같음.
-# 1) 원본 이미지에서 "구조(structure / morphology)" 기준을 미리 추출함
-# 2) 원본 이미지에서 "큰 배치(composition)" 기준도 미리 추출함
-# 3) 매 reverse diffusion step마다 semantic branch(prompt_s)와
-#    anchor branch(prompt_k)를 각각 계산함
-# 4) 둘을 여러 비율 w로 섞어 보고,
+# 아이디어
+# 1) 원본 이미지에서 "구조(structure / morphology)" 기준을 미리 추출
+# 2) 원본 이미지에서 "큰 배치(composition)" 기준도 미리 추출
+# 3) 매 reverse diffusion step마다 semantic branch(prompt_s)와 anchor branch(prompt_k)를 각각 계산
+# 4) 위 branch를 여러 비율(w)로 섞어,
 #    - 구조 보존 손실
 #    - 구성 보존 손실
 #    - 의미적 이득
-#    을 함께 고려한 목적함수(objective)가 가장 좋은 w를 선택함
+#    을 함께 고려한 목적함수(objective)가 가장 좋은 w를 선택
 #
-# 즉, 고정된 비율로 끝까지 가는 방식이 아니라,
+# 기존 방식처럼 고정된 비율로 끝까지 가는 방식이 아닌
 # "현재 step에서는 어느 정도 semantic 쪽으로 갈 것인가?"를
-# 매 step마다 다시 결정하는 적응형(adaptive) 편집 방식이라고 볼 수 있음.
+# 매 step마다 다시 결정하는 적응형(adaptive) 편집 방식
 # ============================================================================
 
 
@@ -39,17 +37,17 @@ from diffusers.schedulers import DDIMScheduler
 
 def seeded_randn(shape, device: str, dtype: torch.dtype, seed: Optional[int] = None) -> torch.Tensor:
     """
-    시드(seed)가 주어진 경우 재현 가능한 난수를 생성함.
+    시드(seed) 재현 가능한 난수 생성
 
-    왜 device별로 분기하는가?
-    - CUDA는 CUDA Generator를 사용하는 편이 자연스러움
-    - MPS는 일부 환경에서 CPU Generator로 만든 뒤 옮기는 방식이 더 안전할 수 있음
-    - CPU는 일반적인 torch.Generator를 사용하면 됨
+    device별 분기
+    - CUDA : CUDA Generator
+    - MPS : CPU Generator로 만든 뒤 옮기는 방식이 더 안전
+    - CPU : 일반적인 torch.Generator
 
     반환값은 주어진 shape, device, dtype을 갖는 텐서이며,
     diffusion 시작 노이즈나 기준 노이즈(noise basis)를 만들 때 사용됨.
     """
-    # seed가 있으면 동일한 난수를 다시 만들 수 있으므로 실험 재현성이 생김
+
     if seed is not None:
         if device == "cuda":
             gen = torch.Generator(device="cuda")
@@ -67,12 +65,12 @@ def seeded_randn(shape, device: str, dtype: torch.dtype, seed: Optional[int] = N
 
 def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     """
-    두 텐서의 코사인 유사도를 계산함.
+    두 텐서의 코사인 유사도 계산.
 
-    여기서는 구조 서명(signature)끼리 얼마나 비슷한지 비교할 때 사용됨.
-    값의 범위는 대략 -1 ~ 1이며, 1에 가까울수록 방향이 매우 비슷함.
+    구조 signature끼리 얼마나 비슷한지 비교.
+    값의 범위는 -1 ~ 1이며, 1에 가까울수록 방향이 매우 비슷.
     """
-    # 코사인 유사도는 길이보다 방향 비교가 중요하므로 먼저 정규화함
+    # 코사인 유사도는 길이보다 방향 비교가 중요하므로 먼저 정규화
     a = F.normalize(a.float(), dim=-1)
     b = F.normalize(b.float(), dim=-1)
     return F.cosine_similarity(a, b, dim=-1).item()
@@ -80,11 +78,10 @@ def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def lowpass_latent(latent: torch.Tensor, kernel_size: int = 4) -> torch.Tensor:
     """
-    latent를 저주파(low-pass) 버전으로 축약함.
+    latent를 저주파(low-pass) 버전으로 축약.
 
-    avg_pool2d를 사용해 큰 윤곽/배치 정보만 남기고
-    세부 고주파 성분은 줄이는 역할을 함.
-    즉, composition(구도/배치) 유사도를 비교할 때 쓰는 함수임.
+    avg_pool2d를 사용해 큰 윤곽/배치 정보만 남기고 세부 고주파 성분은 줄임.
+    composition(구도/배치) 유사도를 비교할 때 사용.
     """
     # kernel_size가 1 이하이면 사실상 low-pass를 하지 않는 것과 같음
     if kernel_size <= 1:
@@ -94,11 +91,11 @@ def lowpass_latent(latent: torch.Tensor, kernel_size: int = 4) -> torch.Tensor:
 
 def normalized_mse(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> float:
     """
-    정규화된 평균제곱오차(Normalized MSE)를 계산함.
+    정규화된 평균제곱오차(Normalized MSE) 계산
 
     단순 MSE만 쓰면 비교 대상의 스케일에 따라 값이 크게 달라질 수 있으므로,
-    분모에 기준 텐서 b의 에너지(mean square)를 넣어 상대적 오차처럼 사용함.
-    composition 손실(comp_pen)을 계산할 때 사용됨.
+    분모에 기준 텐서 b의 에너지(mean square)를 넣어 상대적 오차처럼 사용.
+    composition 손실(comp_pen)을 계산할 때 사용.
     """
     num = (a.float() - b.float()).pow(2).mean()
     den = b.float().pow(2).mean() + eps
@@ -106,39 +103,39 @@ def normalized_mse(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> float
 
 
 # ============================================================
-# 구조 서명(Structural Signature) 저장소
+# Structural Signature 저장소
 # ============================================================
 
 class StructuralSignatureStore:
     """
-    각 step / 각 stream에서 추출한 attention sketch를 저장하고,
-    이를 하나의 "구조 서명(structural signature)" 벡터로 합치는 저장소임.
+    각 step, 각 stream에서 추출한 attention sketch를 저장하고,
+    이를 하나의 structural signature 벡터로 합치는 저장소.
 
-    stream 예시
+    stream
     - SRC_MORPH: 원본 이미지에서 뽑은 구조 기준
     - S_live: 현재 step의 semantic branch 구조
     - K_live: 현재 step의 anchor branch 구조
 
-    이 클래스의 핵심은 여러 레이어에서 얻은 sketch를 정규화하고,
-    레이어별 가중치를 반영한 뒤 하나의 벡터로 이어붙여 비교 가능하게 만드는 데 있음.
+    이 클래스는 여러 레이어에서 얻은 sketch를 정규화하고,
+    레이어별 가중치를 반영한 뒤 하나의 벡터로 이어붙여 비교 가능하게 만듦
     """
     def __init__(self, layer_weight_patterns: Optional[Dict[str, float]] = None):
         """
-        layer_weight_patterns는 레이어 이름 패턴별 가중치를 지정함.
-        예: up_blocks.2는 더 중요한 구조 정보라고 보고 더 큰 가중치를 줄 수 있음.
+        layer_weight_patterns: 레이어 이름 패턴별 가중치를 지정.
+        예) up_blocks.2는 더 중요한 구조 정보라고 보고 더 큰 가중치를 줄 수 있음.
         """
         self.layer_weight_patterns = layer_weight_patterns or {}
         self.current_stream: Optional[str] = None
         self.step_store: Dict[str, OrderedDict[str, torch.Tensor]] = {}
 
     def set_stream(self, stream_id: Optional[str]):
-        """현재 어떤 stream에 기록할지 선택함."""
+        """현재 어떤 stream에 기록할지 선택"""
         self.current_stream = stream_id
         if stream_id is not None and stream_id not in self.step_store:
             self.step_store[stream_id] = OrderedDict()
 
     def add(self, layer_name: str, sketch: torch.Tensor):
-        """현재 stream에 특정 레이어의 attention sketch를 저장함."""
+        """현재 stream에 특정 레이어의 attention sketch를 저장"""
         if self.current_stream is None:
             return
         if self.current_stream not in self.step_store:
@@ -146,14 +143,14 @@ class StructuralSignatureStore:
         self.step_store[self.current_stream][layer_name] = sketch.detach()
 
     def reset(self, stream_id: Optional[str] = None):
-        """저장된 sketch를 초기화함. stream_id가 없으면 전체를 비움."""
+        """저장된 sketch를 초기화. stream_id가 없으면 전체를 비움."""
         if stream_id is None:
             self.step_store = {}
             return
         self.step_store[stream_id] = OrderedDict()
 
     def get_layer_weight(self, layer_name: str) -> float:
-        """레이어 이름에 맞는 가중치를 반환함. 지정되지 않으면 1.0 사용."""
+        """레이어 이름에 맞는 가중치를 반환. 지정되지 않으면 1.0 사용."""
         for pattern, weight in self.layer_weight_patterns.items():
             if pattern in layer_name:
                 return float(weight)
@@ -161,7 +158,7 @@ class StructuralSignatureStore:
 
     def collect(self, stream_id: str) -> Optional[torch.Tensor]:
         """
-        특정 stream에 쌓인 레이어별 sketch를 하나의 서명 벡터로 통합함.
+        특정 stream에 쌓인 레이어별 sketch를 하나의 signature veoctr 로 통합
 
         처리 순서
         1) 각 sketch를 평균 0, 표준편차 1로 정규화
@@ -174,7 +171,7 @@ class StructuralSignatureStore:
         if stream_id not in self.step_store or len(self.step_store[stream_id]) == 0:
             return None
 
-        # 레이어별 sketch를 하나씩 정규화/가중합해 최종 서명을 구성함
+        # 레이어별 sketch를 하나씩 정규화/가중합해 최종 서명을 구성
         signatures = []
         for layer_name, sketch in self.step_store[stream_id].items():
             x = sketch.float()
@@ -196,17 +193,15 @@ class StructuralSignatureStore:
 
 class StructuralAttentionProcessor:
     """
-    UNet의 attention processor를 교체하여,
-    실제 self-attention 패턴의 일부를 "스케치(sketch)" 형태로 저장하는 클래스임.
+    UNet의 attention processor를 교체하여, 실제 self-attention 패턴의 일부를 "스케치(sketch)" 형태로 저장하는 클래스
 
-    모든 attention 행렬을 통째로 저장하면 메모리와 계산량이 매우 커지므로,
-    이 구현은
-    - query 위치를 일부 anchor query로 샘플링하고
-    - key 축은 bucket으로 축약한 뒤
-    - head 평균을 취해
-    구조 정보를 압축해서 보관함.
+    모든 attention 행렬을 통째로 저장하면 메모리와 계산량이 매우 커지므로
+    - query 위치를 일부 anchor query로 샘플링
+    - key 축은 bucket으로 축약
+    - head 평균
+    구조 정보를 압축해서 보관
 
-    즉, "이미지 내부 구조 관계를 가볍게 요약한 attention fingerprint"를 만든다고 이해하면 됨.
+    이미지 내부 구조 관계를 가볍게 요약한 attention fingerprint
     """
     def __init__(
         self,
@@ -217,10 +212,10 @@ class StructuralAttentionProcessor:
         num_key_buckets: int = 64,
     ):
         """
-        num_anchor_queries: attention map에서 몇 개의 query 위치만 대표로 볼지
-        num_key_buckets: key 방향 길이를 몇 개 bucket으로 축약할지
+        num_anchor_queries: attention map에서 사용할 query 개수
+        num_key_buckets: key 방향 길이를 bucket으로 축약한 개수
 
-        두 값을 줄이면 더 가볍고, 늘리면 더 세밀한 구조 정보를 담을 수 있음.
+        두 값을 줄이면 더 가볍고, 늘리면 더 세밀한 구조 정보
         """
         self.store = store
         self.layer_name = layer_name
@@ -229,7 +224,7 @@ class StructuralAttentionProcessor:
         self.num_key_buckets = num_key_buckets
 
     def _reshape_heads(self, x: torch.Tensor, num_heads: int) -> torch.Tensor:
-        """[B, Seq, Dim] -> [B, Heads, Seq, HeadDim] 형태로 바꿈."""
+        """[B, Seq, Dim] -> [B, Heads, Seq, HeadDim]"""
         bsz, seq_len, dim = x.shape
         head_dim = dim // num_heads
         return x.reshape(bsz, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
@@ -243,8 +238,7 @@ class StructuralAttentionProcessor:
         key_len: int,
     ) -> Optional[torch.Tensor]:
         """
-        diffusers 내부 포맷의 attention mask를 scaled dot-product attention에 맞게 정리함.
-        필요 시 query 길이에 맞춰 expand도 수행함.
+        diffusers 내부 포맷의 attention mask를 scaled dot-product attention에 맞게 수정, 필요 시 query 길이에 맞춰 expand도 수행
         """
         if attention_mask is None:
             return None
@@ -273,7 +267,7 @@ class StructuralAttentionProcessor:
         attention_mask: Optional[torch.Tensor],
     ):
         """
-        self-attention의 일부를 구조 스케치로 기록함.
+        self-attention의 일부를 구조 스케치로 기록
 
         처리 흐름
         1) query 위치 중 일부만 anchor로 선택
@@ -283,7 +277,7 @@ class StructuralAttentionProcessor:
         5) key 방향 길이를 bucket 수로 축약
         6) store에 저장
 
-        이렇게 하면 전체 attention map을 저장하지 않고도 구조 정보를 남길 수 있음.
+        전체 attention map을 저장하지 않고도 구조 정보 확보
         """
         if not self.record_attention or self.store.current_stream is None:
             return
@@ -293,7 +287,7 @@ class StructuralAttentionProcessor:
         if num_anchors <= 0:
             return
 
-        # query 전체를 다 쓰지 않고, 길이 전반에 고르게 퍼진 anchor query만 선택함
+        # query 전체를 다 쓰지 않고, 길이 전반에 고르게 퍼진 anchor query만 선택
         anchor_idx = torch.linspace(0, q_len - 1, steps=num_anchors, device=query.device)
         anchor_idx = torch.round(anchor_idx).long().unique(sorted=True)
 
@@ -326,11 +320,9 @@ class StructuralAttentionProcessor:
         **kwargs,
     ) -> torch.Tensor:
         """
-        diffusers Attention processor 인터페이스를 따르는 호출 함수임.
+        diffusers Attention processor 인터페이스를 따르는 호출 함수
 
-        실제 attention 연산은 정상적으로 수행하되,
-        self-attention일 경우에만 구조 스케치를 따로 기록함.
-        따라서 모델 동작을 바꾸기보다, "기존 연산 + 부가 기록"에 가깝다고 보면 됨.
+        실제 attention 연산은 정상적으로 수행하되, self-attention일 경우에만 구조 스케치를 따로 기록
         """
         residual = hidden_states
 
@@ -345,7 +337,7 @@ class StructuralAttentionProcessor:
             batch_size, _, _ = hidden_states.shape
             channel = height = width = None
 
-        # encoder_hidden_states가 없으면 self-attention, 있으면 cross-attention으로 간주함
+        # encoder_hidden_states가 없으면 self-attention, 있으면 cross-attention
         if encoder_hidden_states is None:
             is_self_attention = True
             encoder_hidden_states = hidden_states
@@ -373,9 +365,8 @@ class StructuralAttentionProcessor:
             key_len=key.shape[-2],
         )
 
-        # 구조 서명은 self-attention에서만 추출함.
-        # cross-attention은 텍스트 조건 반영에는 중요하지만,
-        # 여기서는 원본의 공간 구조 비교 대상으로는 사용하지 않음.
+        # 구조 서명은 self-attention에서만 추출
+        # cross-attention은 텍스트 조건 반영에는 중요하지만, 원본의 공간 구조 비교 대상으로는 사용하지 않음
         if is_self_attention:
             self._record_attention_sketch(attn, query, key, attn_mask)
 
@@ -414,13 +405,13 @@ def install_structural_processors(
     num_key_buckets: int,
 ):
     """
-    UNet의 attention processor를 StructuralAttentionProcessor로 교체함.
+    UNet의 attention processor를 StructuralAttentionProcessor로 교체
 
-    단, 모든 attention 레이어를 기록하는 것은 아니고,
+    모든 attention 레이어를 기록하는 것 아님.
     target_patterns에 해당하는 self-attention 레이어만 구조 기록 대상으로 삼음.
-    원래 processor는 반환해 두었다가 finally 블록에서 복원함.
+    원래 processor는 반환해 두었다가 finally 블록에서 복원
     """
-    # 원래 attention processor를 저장해 두었다가 마지막에 반드시 복원함
+    # 원래 attention processor를 저장해 두었다가 마지막에 복원
     original_attn_processors = dict(pipe.unet.attn_processors)
     new_processors = {}
     target_patterns = list(target_patterns)
@@ -442,12 +433,11 @@ def install_structural_processors(
 
 def encode_cfg_prompt(pipe: StableDiffusionPipeline, prompt: str, device: str, dtype: torch.dtype) -> torch.Tensor:
     """
-    CFG(Classifier-Free Guidance)용 텍스트 임베딩을 만듦.
+    CFG(Classifier-Free Guidance)용 텍스트 임베딩
 
-    ["", prompt] 두 문장을 함께 인코딩하여
+    ["", prompt] 두 문장을 함께 인코딩
     - 첫 번째: unconditional branch
     - 두 번째: conditional(text) branch
-    로 사용함.
     """
     tokenizer = pipe.tokenizer
     text_input = tokenizer(
@@ -463,7 +453,7 @@ def encode_cfg_prompt(pipe: StableDiffusionPipeline, prompt: str, device: str, d
 
 
 def encode_single_prompt(pipe: StableDiffusionPipeline, prompt: str, device: str, dtype: torch.dtype) -> torch.Tensor:
-    """단일 프롬프트를 임베딩함. 여기서는 빈 프롬프트("")용으로 주로 사용됨."""
+    """단일 프롬프트를 임베딩. 여기서는 빈 프롬프트("")용으로 주로 사용."""
     tokenizer = pipe.tokenizer
     text_input = tokenizer(
         [prompt],
@@ -479,7 +469,7 @@ def encode_single_prompt(pipe: StableDiffusionPipeline, prompt: str, device: str
 
 def load_image_latent(pipe: StableDiffusionPipeline, image_path: str, device: str, dtype: torch.dtype) -> torch.Tensor:
     """
-    입력 이미지를 읽어서 Stable Diffusion VAE latent 공간으로 인코딩함.
+    입력 이미지를 읽어서 Stable Diffusion VAE latent 공간으로 인코딩
 
     처리 순서
     - 512x512로 resize
@@ -487,7 +477,7 @@ def load_image_latent(pipe: StableDiffusionPipeline, image_path: str, device: st
     - VAE encoder 통과
     - scaling_factor 반영
 
-    이후 diffusion은 픽셀 공간이 아니라 latent 공간에서 진행됨.
+    이후 diffusion은 픽셀 공간이 아니라 latent 공간에서 진행
     """
     image = Image.open(image_path).convert("RGB").resize((512, 512))
     arr = np.array(image).astype(np.float32) / 127.5 - 1.0
@@ -498,7 +488,7 @@ def load_image_latent(pipe: StableDiffusionPipeline, image_path: str, device: st
 
 
 def decode_latent_to_pil(pipe: StableDiffusionPipeline, latents: torch.Tensor) -> Image.Image:
-    """VAE latent를 다시 사람이 볼 수 있는 PIL 이미지로 복원함."""
+    """VAE latent를 다시 사람이 볼 수 있는 PIL 이미지로 복원"""
     latents = latents / pipe.vae.config.scaling_factor
     with torch.no_grad():
         image = pipe.vae.decode(latents).sample
@@ -518,16 +508,13 @@ def variance_preserving_mix(
     guidance_scale: float,
 ) -> Tuple[torch.Tensor, float, float]:
     """
-    semantic branch와 anchor branch의 예측을 단순 선형합이 아니라
-    "분산 보존(variance preserving)" 방식으로 섞음.
-
-    왜 이런 보정이 필요한가?
+    semantic branch와 anchor branch의 예측을 분산 보존(variance preserving) 방식으로 섞음.
     - 두 예측 벡터가 비슷한 방향인지, 반대 방향인지에 따라
       단순 가중합의 크기(norm/variance)가 크게 달라질 수 있음
-    - 이 함수는 cosine similarity를 이용해 그 스케일 변화를 보정함
+    - 이 함수는 cosine similarity를 이용해 그 스케일 변화를 보정
 
     반환값
-    - cfg_noise: 최종적으로 scheduler.step에 넣을 노이즈 예측
+    - cfg_noise: scheduler.step에 넣을 노이즈 예측
     - var_scale_uncond / var_scale_text: 보정에 사용된 스케일 값(진단용)
     """
     # unconditional branch끼리의 방향 유사도
@@ -556,10 +543,10 @@ def compute_semantic_gain(
 ) -> float:
     """
     semantic branch가 anchor branch에 비해 얼마나 다른 방향의 정보를 주는지
-    상대 크기(norm ratio)로 측정하는 휴리스틱 지표임.
+    상대 크기(norm ratio)로 측정하는 휴리스틱 지표
 
-    값이 클수록 "semantic prompt를 더 반영할 여지"가 크다고 해석할 수 있음.
-    이 값은 목적함수에서 semantic 쪽으로 가도록 유도하는 항에 사용됨.
+    값이 클수록 "semantic prompt를 더 반영할 여지"가 크다고 해석
+    이 값은 목적함수에서 semantic 쪽으로 가도록 유도하는 항에 사용
     """
     delta_vec = torch.cat(
         [
@@ -582,13 +569,12 @@ def compute_ddim_sensitivity_schedule(
     timesteps: torch.Tensor,
 ) -> List[float]:
     """
-    DDIM 계수로부터 timestep별 민감도 스케줄 kappa_t를 계산함.
+    DDIM 계수로부터 timestep별 민감도 스케줄 kappa_t를 계산
+    최대값으로 나누어 0~1 부근으로 정규화
 
-    직관적으로는 "이 step의 변화가 결과에 얼마나 크게 작용하는가"를
-    대략 나타내는 가중치라고 이해하면 됨.
-    마지막에는 최대값으로 나누어 0~1 부근으로 정규화함.
+    "이 step의 변화가 결과에 얼마나 크게 작용하는가"를 나타내는 가중치
     """
-    # timestep마다 DDIM 계수 기반 민감도 값을 계산해 둠
+    # timestep마다 DDIM 계수 기반 민감도 값을 계산
     kappas = []
     for i, t in enumerate(timesteps):
         t_int = int(t.item())
@@ -615,11 +601,11 @@ def build_source_forward_targets(
     lowpass_kernel: int,
 ) -> Dict[int, torch.Tensor]:
     """
-    원본 이미지의 "composition 기준"을 timestep별로 미리 만들어 둠.
+    원본 이미지의 "composition 기준"을 timestep별로 미리 계산
 
     각 step에서 원본 latent가 다음 단계(prev_sample 근방)로 갔을 때의
-    저주파 버전을 저장해 두고, 실제 생성 중인 latent의 저주파와 비교함.
-    즉, 전체 배치/구도 보존 기준 역할을 함.
+    저주파 버전을 저장해 두고, 실제 생성 중인 latent의 저주파와 비교
+    전체 배치/구도 보존 기준 역할
     """
     # timestep(int) -> 저주파 composition 기준 latent
     targets = {}
@@ -645,7 +631,7 @@ def build_source_morph_signatures(
     device: str,
 ) -> Dict[int, torch.Tensor]:
     """
-    원본 이미지의 timestep별 구조 서명(morphology signature)을 미리 계산함.
+    원본 이미지의 timestep별 구조 서명(morphology signature)을 미리 계산
 
     방법
     - 원본 latent에 동일한 noise_basis를 timestep별로 추가
@@ -653,7 +639,7 @@ def build_source_morph_signatures(
     - self-attention 기반 구조 서명을 추출
 
     이렇게 얻은 서명은 이후 semantic/anchor branch의 현재 구조와 비교되는
-    "원본 구조 기준(reference)"으로 사용됨.
+    "원본 구조 기준(reference)"으로 사용
     """
     # timestep(int) -> 원본 구조 서명 벡터
     signatures = {}
@@ -674,10 +660,10 @@ def build_source_morph_signatures(
 def morph_penalty_from_w(d_s: float, d_k: float, w: float) -> float:
     """
     semantic/anchor 두 branch의 morphology distance를 바탕으로,
-    혼합 비율 w에서의 구조 손실을 선형 보간으로 근사함.
+    혼합 비율 w에서의 구조 손실을 선형 보간으로 근사
 
-    주의: 실제 혼합 결과에서 attention을 다시 계산한 값이 아니라
-    빠른 탐색을 위한 근사치임.
+    실제 혼합 결과에서 attention을 다시 계산한 값이 아니라
+    빠른 탐색을 위한 근사치
     """
     # w=0이면 anchor 쪽, w=1이면 semantic 쪽 구조 손실을 따르게 됨
     val = d_k + w * (d_s - d_k)
@@ -685,7 +671,7 @@ def morph_penalty_from_w(d_s: float, d_k: float, w: float) -> float:
 
 
 def build_w_candidates(w_max: float, w_step: float) -> List[float]:
-    """탐색할 w 후보들을 생성함. 1.0과 w_max는 누락되지 않도록 보장함."""
+    """탐색할 w 후보들을 생성함. 1.0과 w_max는 누락되지 않도록 보장"""
     # 0부터 w_max까지 균일 간격으로 후보를 만들되, float 오차를 완화하기 위해 작은 epsilon을 더함
     candidates = list(np.arange(0.0, w_max + 1e-8, w_step))
     if 1.0 not in candidates:
@@ -702,7 +688,7 @@ def build_w_candidates(w_max: float, w_step: float) -> List[float]:
 
 @dataclass
 class REX4Diagnostics:
-    """중간 로그 출력 시 사용하는 진단용 값 묶음."""
+    """중간 로그 출력 시 사용하는 진단용 값"""
     phase: float
     sigma_t: float
     kappa_t: float
@@ -754,7 +740,7 @@ def generate_with_rex4(
     seed: Optional[int] = 42,
 ) -> Tuple[Image.Image, RunSummary]:
     """
-    REX 4.0 편집의 핵심 루프.
+
 
     전체 흐름
     1) 텍스트 임베딩 준비
@@ -766,8 +752,7 @@ def generate_with_rex4(
     7) 해당 w로 다음 latent(prev_sample)로 이동
     8) 마지막 latent를 이미지로 복원
 
-    여기서 가장 중요한 점은, w를 한 번 정하고 끝까지 쓰는 것이 아니라
-    매 step마다 다시 선택한다는 점임.
+    w를 한 번 정하고 끝까지 쓰는 것이 아니라 매 step마다 다시 선택
     """
     # 레이어별 구조 sketch를 모아 최종 서명으로 바꿔 주는 저장소 생성
     store = StructuralSignatureStore(
@@ -861,7 +846,7 @@ def generate_with_rex4(
                 phase = i / max(1, len(timesteps) - 1)
                 kappa_t = kappa_schedule[i]
 
-                # CFG 계산을 위해 같은 latent를 2개 복제하여 [uncond, cond] 배치로 만듦
+                # CFG 계산을 위해 같은 latent를 2개 복제하여 [uncond, cond] 배치 구성
                 latent_in = torch.cat([latents] * 2)
                 latent_in = pipe.scheduler.scale_model_input(latent_in, t)
 
@@ -1011,7 +996,7 @@ def generate_with_rex4(
 # ============================================================
 
 def main():
-    """커맨드라인 인자를 받아 파이프라인을 로드하고 REX 4.0을 실행함."""
+
     parser = argparse.ArgumentParser(description="REX 4.0: 원본 구조/구성 기준을 사용해 step별 1차원 탐색을 수행하는 편집 알고리즘")
 
     parser.add_argument("--prompt_s", type=str, required=True, help="목표 의미를 반영할 semantic 프롬프트")
