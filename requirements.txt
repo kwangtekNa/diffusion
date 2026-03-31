@@ -1,6 +1,17 @@
-torch
-diffusers
-transformers
-accelerate
-pillow
-numpy
+# Core Deep Learning
+torch>=2.0.0
+torchvision
+
+# Diffusion & Generative Models
+diffusers>=0.20.0
+transformers>=4.30.0
+accelerate>=0.20.0
+huggingface-hub>=0.16.4
+
+# Image Processing & Math
+Pillow>=9.0.0
+numpy>=1.20.0
+
+# Scientific Computing
+scipy
+matplotlib
